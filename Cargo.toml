@@ -1,6 +1,6 @@
 [package]
 name = "mockalloc"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Diggory Blake <diggsey@googlemail.com>"]
 edition = "2018"
 readme = "README.md"
@@ -8,6 +8,8 @@ license = "MIT OR Apache-2.0"
 keywords = ["memory", "allocation", "mock", "leak", "test"]
 categories = ["development-tools::testing", "memory-management"]
 description = "A crate to allow testing code which uses the global allocator."
+documentation = "https://docs.rs/mockalloc/"
+repository = "https://github.com/Diggsey/mockalloc"
 
 [workspace]
 members = ["mockalloc-macros"]

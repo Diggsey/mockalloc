@@ -341,8 +341,16 @@ pub fn record_allocs(f: impl FnOnce()) -> AllocInfo {
 
 /// Records the allocations within a code block and asserts that no issues
 /// were detected.
+///
+/// No checks are performed if `miri` is detected, as we cannot collect
+/// allocation data in that case, and `miri` performs many of these
+/// checks already.
 pub fn assert_allocs(f: impl FnOnce()) {
-    record_allocs(f).result.unwrap();
+    if cfg!(miri) {
+        f();
+    } else {
+        record_allocs(f).result.unwrap();
+    }
 }
 
 /// Returns `true` if allocations are currently being recorded, ie. if
