@@ -3,6 +3,9 @@ name = "mockalloc-macros"
 version = "0.1.0"
 authors = ["Diggory Blake <diggsey@googlemail.com>"]
 edition = "2018"
+readme = "../README.md"
+license = "MIT OR Apache-2.0"
+description = "Procedural macro attribute for the mockalloc crate."
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
