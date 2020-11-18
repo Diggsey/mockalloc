@@ -1,6 +1,6 @@
 [package]
 name = "mockalloc"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Diggory Blake <diggsey@googlemail.com>"]
 edition = "2018"
 readme = "README.md"
@@ -11,8 +11,12 @@ description = "A crate to allow testing code which uses the global allocator."
 documentation = "https://docs.rs/mockalloc/"
 repository = "https://github.com/Diggsey/mockalloc"
 
+[features]
+tracing = ["backtrace"]
+
 [workspace]
 members = ["mockalloc-macros"]
 
 [dependencies]
 mockalloc-macros = { version = "0.1.0", path = "mockalloc-macros" }
+backtrace = { version = "0.3", optional = true }

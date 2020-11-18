@@ -9,6 +9,18 @@
 //! - Invalid frees (bad size)
 //! - Invalid frees (bad alignment)
 //!
+//! Once a bug is detected, you can enable the `tracing` feature of this crate
+//! to collect detailed information about the problem including backtraces showing
+//! where memory was allocated and freed.
+//!
+//! In the case the memory was leaked, it is also possible to find a list of
+//! backtraces showing possitibilities for where we expected the memory to be freed.
+//!
+//! Note: the `tracing` feature incurs a significant performance penalty. (Although it
+//! is significantly faster than running the code under `miri`). You should also be
+//! aware that backtraces are often less complete in release builds where many frames are
+//! optimized out.
+//!
 //! ## Usage
 //!
 //! Typical use involves enabling the `Mockalloc` allocator during tests, eg:
@@ -116,8 +128,13 @@
 //! of a collision.
 
 use std::alloc::{GlobalAlloc, Layout};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::thread_local;
+
+#[cfg(feature = "tracing")]
+/// Functionality for detailed tracing of allocations. Enabled with the
+/// `tracing` feature.
+pub mod tracing;
 
 // Probably overkill, but performance isn't a huge concern
 fn hash_fn(p: usize) -> u128 {
@@ -135,17 +152,22 @@ fn hash_fn(p: usize) -> u128 {
 
 #[derive(Default)]
 struct LocalState {
-    enabled: bool,
     ptr_accum: u128,
     ptr_size_accum: u128,
     ptr_align_accum: u128,
     num_allocs: u64,
     num_frees: u64,
+    mem_allocated: u64,
+    mem_freed: u64,
+    peak_mem: u64,
+    peak_mem_allocs: u64,
+    #[cfg(feature = "tracing")]
+    tracing: tracing::TracingState,
 }
 
 impl LocalState {
     fn record_alloc(&mut self, ptr: *const u8, layout: Layout) {
-        if !self.enabled || ptr.is_null() {
+        if ptr.is_null() {
             return;
         }
         let ptr_hash = hash_fn(ptr as usize);
@@ -159,11 +181,20 @@ impl LocalState {
             .ptr_align_accum
             .wrapping_add(ptr_hash.wrapping_mul(align_hash));
         self.num_allocs += 1;
+        self.mem_allocated += layout.size() as u64;
+
+        if self.mem_allocated > self.mem_freed {
+            let mem_usage = self.mem_allocated - self.mem_freed;
+            if mem_usage > self.peak_mem {
+                self.peak_mem = mem_usage;
+                self.peak_mem_allocs = self.num_allocs.saturating_sub(self.num_frees);
+            }
+        }
+
+        #[cfg(feature = "tracing")]
+        self.tracing.record_alloc(ptr, layout);
     }
     fn record_free(&mut self, ptr: *const u8, layout: Layout) {
-        if !self.enabled {
-            return;
-        }
         let ptr_hash = hash_fn(ptr as usize);
         let size_hash = hash_fn(layout.size());
         let align_hash = hash_fn(layout.align());
@@ -175,19 +206,18 @@ impl LocalState {
             .ptr_align_accum
             .wrapping_sub(ptr_hash.wrapping_mul(align_hash));
         self.num_frees += 1;
+        self.mem_freed += layout.size() as u64;
+
+        #[cfg(feature = "tracing")]
+        self.tracing.record_free(ptr, layout);
     }
     fn start(&mut self) {
-        assert!(!self.enabled, "Mockalloc already enabled");
-        self.enabled = true;
-        self.ptr_accum = 0;
-        self.ptr_size_accum = 0;
-        self.ptr_align_accum = 0;
-        self.num_allocs = 0;
-        self.num_frees = 0;
+        *self = Default::default();
+        #[cfg(feature = "tracing")]
+        self.tracing.start();
     }
 
     fn finish(&mut self) -> AllocInfo {
-        self.enabled = false;
         let result = if self.num_allocs > self.num_frees {
             Err(AllocError::Leak)
         } else if self.num_allocs < self.num_frees {
@@ -208,11 +238,18 @@ impl LocalState {
             result,
             num_allocs: self.num_allocs,
             num_frees: self.num_frees,
+            mem_allocated: self.mem_allocated,
+            mem_freed: self.mem_freed,
+            peak_mem: self.peak_mem,
+            peak_mem_allocs: self.peak_mem_allocs,
+            #[cfg(feature = "tracing")]
+            tracing: self.tracing.finish(),
         }
     }
 }
 
 thread_local! {
+    static ENABLED: Cell<bool> = Cell::new(false);
     static LOCAL_STATE: RefCell<LocalState> = RefCell::new(LocalState::default());
 }
 
@@ -224,16 +261,14 @@ pub struct Mockalloc<T: GlobalAlloc>(pub T);
 unsafe impl<T: GlobalAlloc> GlobalAlloc for Mockalloc<T> {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         let ptr = self.0.alloc(layout);
-        LOCAL_STATE.with(|rc| {
-            let mut state = rc.borrow_mut();
+        with_local_state(|state| {
             state.record_alloc(ptr, layout);
         });
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        LOCAL_STATE.with(|rc| {
-            let mut state = rc.borrow_mut();
+        with_local_state(|state| {
             state.record_free(ptr, layout);
         });
         self.0.dealloc(ptr, layout);
@@ -244,8 +279,7 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for Mockalloc<T> {
         // `layout.align()` comes from a `Layout` and is thus guaranteed to be valid.
         let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
         let new_ptr = self.0.realloc(ptr, layout, new_size);
-        LOCAL_STATE.with(|rc| {
-            let mut state = rc.borrow_mut();
+        with_local_state(|state| {
             state.record_free(ptr, layout);
             state.record_alloc(new_ptr, new_layout);
         });
@@ -254,8 +288,7 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for Mockalloc<T> {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let ptr = self.0.alloc_zeroed(layout);
-        LOCAL_STATE.with(|rc| {
-            let mut state = rc.borrow_mut();
+        with_local_state(|state| {
             state.record_alloc(ptr, layout);
         });
         ptr
@@ -293,7 +326,13 @@ pub enum AllocError {
 pub struct AllocInfo {
     num_allocs: u64,
     num_frees: u64,
+    mem_allocated: u64,
+    mem_freed: u64,
+    peak_mem: u64,
+    peak_mem_allocs: u64,
     result: Result<(), AllocError>,
+    #[cfg(feature = "tracing")]
+    tracing: tracing::TracingInfo,
 }
 
 impl AllocInfo {
@@ -305,9 +344,38 @@ impl AllocInfo {
     pub fn num_frees(&self) -> u64 {
         self.num_frees
     }
+    /// Returns the total number of frees performed.
+    pub fn num_leaks(&self) -> u64 {
+        self.num_allocs - self.num_frees
+    }
+    /// Returns the total amount of memory allocated.
+    pub fn mem_allocated(&self) -> u64 {
+        self.mem_allocated
+    }
+    /// Returns the total amount of memory leaked.
+    pub fn mem_leaked(&self) -> u64 {
+        self.mem_allocated - self.mem_freed
+    }
+    /// Returns the total amount of memory leaked.
+    pub fn mem_freed(&self) -> u64 {
+        self.mem_freed
+    }
+    /// Returns peak memory usage, not including any overhead used by the allocator.
+    pub fn peak_mem(&self) -> u64 {
+        self.peak_mem
+    }
+    /// Returns the number of active allocations during peak memory usage.
+    pub fn peak_mem_allocs(&self) -> u64 {
+        self.peak_mem_allocs
+    }
     /// Returns an `Err(..)` result if any allocation bugs were detected.
     pub fn result(&self) -> Result<(), AllocError> {
         self.result.clone()
+    }
+    /// Returns the detailed trace of leaks and errors.
+    #[cfg(feature = "tracing")]
+    pub fn tracing(&self) -> &tracing::TracingInfo {
+        &self.tracing
     }
 }
 
@@ -316,10 +384,15 @@ struct AllocChecker(bool);
 impl AllocChecker {
     fn new() -> Self {
         LOCAL_STATE.with(|rc| rc.borrow_mut().start());
+        ENABLED.with(|c| {
+            assert!(!c.get(), "Mockalloc already recording");
+            c.set(true);
+        });
         Self(true)
     }
     fn finish(mut self) -> AllocInfo {
         self.0 = false;
+        ENABLED.with(|c| c.set(false));
         LOCAL_STATE.with(|rc| rc.borrow_mut().finish())
     }
 }
@@ -327,6 +400,7 @@ impl AllocChecker {
 impl Drop for AllocChecker {
     fn drop(&mut self) {
         if self.0 {
+            ENABLED.with(|c| c.set(false));
             LOCAL_STATE.with(|rc| rc.borrow_mut().finish());
         }
     }
@@ -345,18 +419,35 @@ pub fn record_allocs(f: impl FnOnce()) -> AllocInfo {
 /// No checks are performed if `miri` is detected, as we cannot collect
 /// allocation data in that case, and `miri` performs many of these
 /// checks already.
+///
+/// If the `tracing` feature is enabled and an error or leak is detected,
+/// this function also prints out the full trace to `stderr`.
 pub fn assert_allocs(f: impl FnOnce()) {
     if cfg!(miri) {
         f();
     } else {
-        record_allocs(f).result.unwrap();
+        let info = record_allocs(f);
+        #[cfg(feature = "tracing")]
+        if info.result.is_err() {
+            eprintln!("# Mockalloc trace:\n\n{:#?}", info.tracing);
+        }
+        info.result.unwrap();
     }
 }
 
 /// Returns `true` if allocations are currently being recorded, ie. if
 /// we're inside a call to `record_allocs`.
 pub fn is_recording() -> bool {
-    LOCAL_STATE.with(|rc| rc.borrow().enabled)
+    ENABLED.with(|c| c.get())
+}
+
+fn with_local_state(f: impl FnOnce(&mut LocalState)) {
+    if !is_recording() {
+        return;
+    }
+    ENABLED.with(|c| c.set(false));
+    LOCAL_STATE.with(|rc| f(&mut rc.borrow_mut()));
+    ENABLED.with(|c| c.set(true));
 }
 
 pub use mockalloc_macros::test;
@@ -429,8 +520,10 @@ mod tests {
             let _p = Box::new(42);
         });
         alloc_info.result().unwrap();
-        assert_eq!(alloc_info.num_allocs, 1);
-        assert_eq!(alloc_info.num_frees, 1);
+        assert_eq!(alloc_info.num_allocs(), 1);
+        assert_eq!(alloc_info.num_frees(), 1);
+        assert_eq!(alloc_info.peak_mem(), 4);
+        assert_eq!(alloc_info.peak_mem_allocs(), 1);
     }
 
     #[test]
@@ -439,8 +532,8 @@ mod tests {
             mem::forget(Box::new(42));
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::Leak);
-        assert_eq!(alloc_info.num_allocs, 1);
-        assert_eq!(alloc_info.num_frees, 0);
+        assert_eq!(alloc_info.num_allocs(), 1);
+        assert_eq!(alloc_info.num_frees(), 0);
     }
 
     #[test]
@@ -449,16 +542,16 @@ mod tests {
             mem::transmute::<_, Box<f64>>(Box::new(42u32));
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadLayout);
-        assert_eq!(alloc_info.num_allocs, 1);
-        assert_eq!(alloc_info.num_frees, 1);
+        assert_eq!(alloc_info.num_allocs(), 1);
+        assert_eq!(alloc_info.num_frees(), 1);
     }
 
     #[test]
     fn it_detects_no_data() {
         let alloc_info = record_allocs(|| ());
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::NoData);
-        assert_eq!(alloc_info.num_allocs, 0);
-        assert_eq!(alloc_info.num_frees, 0);
+        assert_eq!(alloc_info.num_allocs(), 0);
+        assert_eq!(alloc_info.num_frees(), 0);
     }
 
     #[test]
@@ -467,8 +560,8 @@ mod tests {
             mem::transmute::<_, Box<[u8; 4]>>(Box::new(42u32));
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadAlignment);
-        assert_eq!(alloc_info.num_allocs, 1);
-        assert_eq!(alloc_info.num_frees, 1);
+        assert_eq!(alloc_info.num_allocs(), 1);
+        assert_eq!(alloc_info.num_frees(), 1);
     }
 
     #[test]
@@ -477,8 +570,8 @@ mod tests {
             mem::transmute::<_, Box<[u32; 2]>>(Box::new(42u32));
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadSize);
-        assert_eq!(alloc_info.num_allocs, 1);
-        assert_eq!(alloc_info.num_frees, 1);
+        assert_eq!(alloc_info.num_allocs(), 1);
+        assert_eq!(alloc_info.num_frees(), 1);
     }
 
     #[test]
@@ -489,8 +582,8 @@ mod tests {
             mem::ManuallyDrop::drop(&mut x);
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::DoubleFree);
-        assert_eq!(alloc_info.num_allocs, 1);
-        assert_eq!(alloc_info.num_frees, 2);
+        assert_eq!(alloc_info.num_allocs(), 1);
+        assert_eq!(alloc_info.num_frees(), 2);
     }
 
     #[test]
@@ -500,8 +593,8 @@ mod tests {
             *mem::transmute::<_, &mut usize>(&mut x) += 1;
         });
         assert_eq!(alloc_info.result().unwrap_err(), AllocError::BadPtr);
-        assert_eq!(alloc_info.num_allocs, 1);
-        assert_eq!(alloc_info.num_frees, 1);
+        assert_eq!(alloc_info.num_allocs(), 1);
+        assert_eq!(alloc_info.num_frees(), 1);
     }
 
     #[test]
@@ -512,6 +605,8 @@ mod tests {
             let _unused = do_some_allocations();
         });
         alloc_info.result().unwrap();
+        assert_eq!(alloc_info.peak_mem(), 580);
+        assert_eq!(alloc_info.peak_mem_allocs(), 52);
     }
 
     #[test]
