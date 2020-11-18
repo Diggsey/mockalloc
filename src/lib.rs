@@ -14,7 +14,7 @@
 //! where memory was allocated and freed.
 //!
 //! In the case the memory was leaked, it is also possible to find a list of
-//! backtraces showing possitibilities for where we expected the memory to be freed.
+//! backtraces showing possibilities for where we expected the memory to be freed.
 //!
 //! Note: the `tracing` feature incurs a significant performance penalty. (Although it
 //! is significantly faster than running the code under `miri`). You should also be
@@ -92,8 +92,8 @@
 //! if a pointer returned by an allocation on one thread is later freed by a
 //! different thread.
 //!
-//! The algorithm cannot detect where the bug is, it can only indicate what
-//! kind of bug is present.
+//! When the `tracing` feature is disabled, the algorithm cannot detect where the
+//! bug is, it can only indicate what kind of bug is present.
 //!
 //! ## How it works
 //!

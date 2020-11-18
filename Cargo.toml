@@ -20,3 +20,6 @@ members = ["mockalloc-macros"]
 [dependencies]
 mockalloc-macros = { version = "0.1.0", path = "mockalloc-macros" }
 backtrace = { version = "0.3", optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
